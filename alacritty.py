@@ -1,7 +1,6 @@
 from pygls.lsp.server import LanguageServer
 from pygls.workspace.text_document import TextDocument
 from lsprotocol import types
-from typing import Union
 from configuration import config
 import logging
 
@@ -32,7 +31,7 @@ def get_toml_section(params: types.CompletionParams, document: TextDocument) -> 
         line -= 1
 
     if line < 0:
-        log.error(
+        log.debug(
             "Reached beginning of file looking for section line but couldn't find it"
         )
         return ""
@@ -57,15 +56,23 @@ def get_nested_dict_value(dictionary: dict, keys: str):
     Keys = "Level1.Level2", returns { "Level3": "Value3" }
     Keys = "Level1.Level2.Level3", returns "Value3"
 
+    If keys contain a value that doesn't exist, return back the level above what was trying to be
+    indexed into.
+
+    e.g.
+
+    Keys = "Level1.Level6", returns { "Level2": { "Level3": "Value3" } }
+
+    Essentially the keys string is truncated at the first instance of a bad value.
+
     Args:
         dictionary: Dictionary to index into
         keys: Period seperated string of nested key values
     Returns:
-        A nested dictionary of value from the dictionary parameter
-    Raises:
-        KeyError: If 'keys' tries to index into a dictionary key that doesn't exist
-        IndexError: If 'keys' tries to index into a dictionary key that doesn't exist
+        A value from the dictionary parameter
     """
+    if not keys:
+        return dictionary
 
     key_components = keys.split(".")
     log.debug(f"components: {key_components}")
@@ -76,15 +83,14 @@ def get_nested_dict_value(dictionary: dict, keys: str):
     level = 0
     sub_section = dictionary
 
-    try:
-        while level < key_depth:
+    while level < key_depth:
+        log.debug(f"level: {level}, key_components: {key_components}, sub_section: {sub_section}")
+        if key_components[level] not in sub_section:
+            return sub_section
+        else:
             sub_section = sub_section[key_components[level]]
             log.debug(f"sub_section: {sub_section}")
             level += 1
-    except KeyError:
-        raise KeyError(f"Minor mode doesn't exist")
-    except IndexError:
-        raise IndexError(f"Minor mode doesn't exist")
 
     return sub_section
 
@@ -112,12 +118,16 @@ def completions(params: types.CompletionParams) -> list:
         5. On a completed key within a section after the equal sign e.g.
             [general]
             working_directory = <autocomplete requested>
-        6. On partially completed values within a section
+        6. On partially completed values within a section after the equal sign
             [window]
             dynamic_title = fal<autocomplete requested>
         7. On an empty line before the first section e.g.
             <start of file>
             [<autocomplete requested>
+    Unhandled secnarios:
+        1. Line is "illegitimate_key = <autocomplete requested>"
+        2. Line is "illegitimate_unfinished_key<autocomplete requested>"
+        * Both of these cases if a job for diagnostics and/or code_action*
     Args:
         params: Type completion parameters from pygls used to get the current line number
     Returns:
@@ -127,46 +137,29 @@ def completions(params: types.CompletionParams) -> list:
     document = server.workspace.get_text_document(params.text_document.uri)
 
     current_line = document.lines[params.position.line].strip()
-    current_word = document.word_at_position(params.position).strip()
 
     try:
-        # Get section as period delimited values
-        section = get_toml_section(params, document)
+        # Get section (or partial section) as period delimited values
+        current_section = get_toml_section(params, document)
+        section_value_space = get_nested_dict_value(config, current_section)
+        completion_options = None
 
-        # Obtain the values from the config when you index sub-dictionaries accoridng to the period
-        # delimited sectoin value
-        section_values = get_nested_dict_value(config, section)
-
-        # Cases we handle:
-        # Case 1: Line is empty
-        #   - Provide options as to valid keys in this section
-        #
-        # Case 2: Line is "legitimate_unfinished_key<looking for completion here>"
-        #   - Provide completion options for valid keys that start with current work in this section
-        #
-        # Case 3: Line is "legitimate_key = <looking for completion here>"
-        #   - Provide options as to valid values for this key
-        #
-        # Case 4: Line is "illegitimate_key = <looking for completion here>"
-        #   - Job for "Code_Actions" portion of the LSP server
-        #
-        # Case 5: Line is "illegitimate_unfinished_key<looking for completion here>"
-        #   - Job for "Code_Actions" portion of the LSP server
-
-        options = None
-        key, _, value = current_line.split("=")
-
-        if current_word not in section_values:
-            # Handles Cases 1 & 2
-            if not current_word:
-                log.debug("NULL")
-            log.debug(f"::{current_word}::")
-            options = section_values
+        if current_line and current_line[0] == "[":
+            # We are completing a section line
+            completion_options = section_value_space
         else:
-            # Handles Case 3
-            options = section_values[current_word]
+            # We are completing an entry line
+            key = current_line.split("=")[0].strip()
+            value = None
+            if len(current_line.split("=")) == 2:
+                value = current_line.split("=")[1].strip()
 
-        return [types.CompletionItem(label=opt) for opt in options if None != opt]
+            if value or (key in section_value_space):
+                completion_options = section_value_space[key]
+            else:
+                completion_options = section_value_space
+
+        return [types.CompletionItem(label=opt) for opt in completion_options if None != opt]
 
     except KeyError as e:
         log.error(e)
